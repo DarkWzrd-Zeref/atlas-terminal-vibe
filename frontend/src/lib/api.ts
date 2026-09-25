@@ -6,7 +6,7 @@ import type {
   OptionsPayoffResponse,
 } from "@/lib/options";
 
-const BASE = "";
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 
 export class ApiError extends Error {
   status: number;

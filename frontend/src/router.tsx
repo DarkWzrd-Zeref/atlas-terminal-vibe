@@ -73,4 +73,4 @@ export const router = createBrowserRouter([
       { path: "/alpha-zoo/:alphaId", element: wrap(AlphaZoo) },
     ],
   },
-]);
+], { basename: import.meta.env.BASE_URL.replace(/\/$/, "") });

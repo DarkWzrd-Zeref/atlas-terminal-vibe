@@ -55,7 +55,7 @@ async function requestJson<T>(path: string, options?: RequestInit): Promise<T> {
     });
   }
 
-  const response = await fetch(path, { ...rest, headers: mergedHeaders });
+  const response = await fetch(import.meta.env.BASE_URL.replace(/\/$/, "") + path, { ...rest, headers: mergedHeaders });
   if (!response.ok) {
     let message = `HTTP ${response.status}`;
     try {

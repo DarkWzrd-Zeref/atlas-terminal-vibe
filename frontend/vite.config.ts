@@ -34,6 +34,7 @@ export default defineConfig(({ mode }) => {
   };
 
   return {
+    base: "/apps/vibe/",
     plugins: [react()],
     resolve: {
       alias: { "@": path.resolve(import.meta.dirname, "./src") },
