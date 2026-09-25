@@ -541,6 +541,8 @@ class Runner:
         is logged and the process runs without the drop. The AST static defense in
         backtest/runner.py stays active regardless, so this fallback is safe.
         """
+        if os.environ.get("ATLAS_REQUIRE_ISOLATION") == "1":
+            raise RuntimeError("Atlas requires its native-backtest broker; direct execution is refused")
         creds = _resolve_sandbox_credentials()
         if creds is not None:
             user, group = creds
@@ -587,6 +589,20 @@ class Runner:
         effective_cwd = cwd or entry_script.parent
         pythonpath_extra = cwd if cwd else None
         env = self._build_runtime_env(run_dir, pythonpath_extra=pythonpath_extra)
+        if os.environ.get("ATLAS_REQUIRE_ISOLATION") == "1":
+            # The native tool has exactly this production call contract. Never
+            # turn the privileged broker into a general script/shell launcher.
+            agent_root = Path(__file__).resolve().parents[2]
+            if (entry_script.resolve() != agent_root / "backtest" / "runner.py"
+                    or effective_cwd.resolve() != agent_root
+                    or cli_args != [str(run_dir)]):
+                raise RuntimeError("Atlas isolated Runner accepts only the native BacktestTool operation")
+            from atlas_sandbox import request_backtest
+            try:
+                process = request_backtest(run_dir, self.timeout, env)
+            except RuntimeError as exc:
+                process = subprocess.CompletedProcess("isolated native backtest", 126, "", str(exc))
+            return self._finish_execution(process, run_dir, stdout_path, stderr_path, start_time)
         python_cmd = self._pick_python_interpreter()
         console.print(f"[dim]Runner: using Python: {python_cmd}[/dim]")
 
@@ -644,6 +660,9 @@ class Runner:
             if sandbox_home is not None:
                 shutil.rmtree(sandbox_home, ignore_errors=True)
 
+        return self._finish_execution(process, run_dir, stdout_path, stderr_path, start_time)
+
+    def _finish_execution(self, process, run_dir, stdout_path, stderr_path, start_time) -> RunResult:
         elapsed = time.time() - start_time
         console.print(f"[blue]Runner: subprocess finished in {elapsed:.2f}s[/blue]")
 

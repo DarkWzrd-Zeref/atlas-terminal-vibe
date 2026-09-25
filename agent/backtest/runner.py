@@ -1209,7 +1209,11 @@ def main(run_dir: Path) -> None:
     try:
         from dotenv import load_dotenv
 
-        load_dotenv()
+        # Atlas supplies only explicitly approved loader configuration. Looking
+        # up the service's .env here would undo that environment boundary.
+        import os
+        if os.environ.get("ATLAS_SANDBOX_CHILD") != "1":
+            load_dotenv()
     except ImportError:
         pass
 

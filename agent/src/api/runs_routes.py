@@ -871,6 +871,18 @@ def register_runs_routes(
 
     # --- Routes ---
 
+    @app.get("/runs/{run_id}/freqtrade", dependencies=[Depends(require_auth)])
+    async def get_freqtrade_export(run_id: str):
+        """Read a declared native strategy bundle without importing or executing it."""
+        from src.api.freqtrade_export import ExportError, export_freqtrade
+        _host_validate_path_param(run_id, "run_id")
+        try:
+            return await run_in_threadpool(export_freqtrade, _host_RUNS_DIR(), run_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="This run has no Freqtrade export. Ask Vibe to use the freqtrade-export skill.")
+        except (ExportError, ValueError, UnicodeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
     @app.get("/runs/{run_id}/code", dependencies=[Depends(require_auth)])
     async def get_run_code(run_id: str):
         """Return strategy source files for a run.

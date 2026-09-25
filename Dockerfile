@@ -96,15 +96,16 @@ COPY pyproject.toml LICENSE README.md ./
 COPY agent/ agent/
 COPY --from=frontend-build /app/frontend/dist frontend/dist
 
-# Runtime should not run as root. `vibe` owns the writable app-data dirs so
-# named volumes inherit usable permissions. `vibe-sandbox` is an unprivileged
-# system account (no home, no shell) that runner.py drops into via
-# subprocess.run(user="vibe-sandbox") to execute LLM-generated code with the
-# least privilege — created here by fixed contract, not otherwise used.
+# The application is non-root; Atlas's startup supervisor creates a narrow
+# broker which runs only the native backtest as the reserved sandbox UID.
+# Source and the interpreter remain root-owned and cannot be rewritten by the
+# application or generated code. Writable state is mounted by atlas_start.py.
 RUN useradd --create-home --shell /usr/sbin/nologin vibe \
     && useradd --system --no-create-home --shell /usr/sbin/nologin --uid 10001 vibe-sandbox \
     && mkdir -p agent/runs agent/sessions agent/uploads agent/.swarm/runs /home/vibe/.vibe-trading \
-    && chown -R vibe:vibe /app /home/vibe/.vibe-trading
+    && chown -R root:root /app /opt/venv \
+    && chmod -R go-w /app /opt/venv \
+    && chown vibe:vibe /home/vibe/.vibe-trading
 USER vibe
 
 # Default port
