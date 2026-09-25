@@ -15,7 +15,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 AGENT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("atlas_sandbox", AGENT / "atlas_sandbox.py")
@@ -112,6 +112,68 @@ class BrokerContractTests(unittest.TestCase):
         with patch.object(sandbox.sys, "platform", "not-linux"):
             with self.assertRaises(RuntimeError):
                 sandbox.restrict_filesystem([], [])
+
+
+class TimeoutProbeTests(unittest.TestCase):
+    def test_ready_wait_tolerates_slow_start_and_partial_pid_write(self):
+        process = Mock()
+        process.poll.return_value = None
+        pid_file = Mock()
+        pid_file.read_text.side_effect = [FileNotFoundError(), "", "42"]
+        with patch.object(sandbox.time, "sleep"):
+            self.assertTrue(sandbox._wait_timeout_probe_ready(process, pid_file))
+        self.assertEqual(pid_file.read_text.call_count, 3)
+
+    def test_ready_wait_is_bounded_and_does_not_accept_an_exited_child(self):
+        process = Mock()
+        process.poll.return_value = None
+        pid_file = Mock()
+        pid_file.read_text.side_effect = FileNotFoundError()
+        with patch.object(sandbox.time, "monotonic", side_effect=[0, 11]):
+            self.assertFalse(sandbox._wait_timeout_probe_ready(process, pid_file))
+        process.poll.return_value = 1
+        pid_file.read_text.side_effect = None
+        pid_file.read_text.return_value = "42"
+        self.assertFalse(sandbox._wait_timeout_probe_ready(process, pid_file))
+
+    def test_probe_fork_failure_is_reported_without_exception_message(self):
+        with patch.object(sandbox.os, "fork", create=True,
+                          side_effect=OSError(11, "synthetic-secret-must-not-appear")), \
+             patch("builtins.print") as output:
+            with self.assertRaises(SystemExit):
+                sandbox._timeout_probe_child(Path("unused"))
+        record = output.call_args.args[0]
+        self.assertNotIn("synthetic-secret", record)
+        self.assertEqual(json.loads(record.partition(" ")[2]),
+                         {"stage": "fork", "error_type": "BlockingIOError", "errno": 11})
+
+    def test_diagnostics_distinguish_missing_live_and_reaped_descendants(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_file = Path(temporary) / "pid"
+            result = {"timed_out": True, "returncode": -9, "probe_ready": False, "stderr": ""}
+            missing = sandbox._timeout_probe_diagnostics(result, pid_file)
+            self.assertFalse(missing["detached_pid_file_exists"])
+            self.assertFalse(missing["descendant_pid_valid"])
+            self.assertFalse(missing["probe_ready"])
+            pid_file.write_text("42")
+            result["probe_ready"] = True
+            with patch.object(sandbox.os, "kill"):
+                self.assertTrue(sandbox._timeout_probe_diagnostics(result, pid_file)["descendant_alive"])
+            with patch.object(sandbox.os, "kill", side_effect=ProcessLookupError()):
+                gone = sandbox._timeout_probe_diagnostics(result, pid_file)
+            self.assertTrue(gone["descendant_pid_valid"])
+            self.assertFalse(gone["descendant_alive"])
+
+    def test_diagnostics_only_admit_fixed_error_metadata(self):
+        result = {"timed_out": False, "returncode": 1, "stderr":
+            'ATLAS_TIMEOUT_PROBE {"stage":"fork","error_type":"OSError","errno":11,"secret":"synthetic"}\n'
+            "PermissionError: synthetic-secret\n"}
+        missing = Mock()
+        missing.is_file.return_value = False
+        diagnostics = sandbox._timeout_probe_diagnostics(result, missing)
+        self.assertEqual(diagnostics["child_error"], {"stage": "fork", "error_type": "OSError", "errno": 11})
+        self.assertEqual(diagnostics["stderr_error_type"], "PermissionError")
+        self.assertNotIn("synthetic", json.dumps(diagnostics))
 
 
 class ChildSettingsTests(unittest.TestCase):

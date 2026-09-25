@@ -271,6 +271,77 @@ def _kill_sandbox_processes(uid: int) -> None:
             pass
 
 
+def _wait_timeout_probe_ready(process, pid_file: Path, timeout: float = 10) -> bool:
+    """Bound startup separately so the timeout exercises a real descendant."""
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        try:
+            if int(pid_file.read_text()) > 1:
+                return True
+        except (FileNotFoundError, ValueError):
+            pass  # File creation and its first write need not be atomic.
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    return False
+
+
+def _timeout_probe_child(run: Path) -> None:
+    stage = "fork"
+    try:
+        if os.fork() == 0:
+            stage = "detach"
+            os.setsid()
+            stage = "pid_file"
+            (run / "detached-probe.pid").write_text(str(os.getpid()))
+        while True:
+            time.sleep(1)
+    except Exception as exc:
+        # Only this fixed synthetic probe uses this record. Never print the
+        # exception message, paths, environment, or any generated-code output.
+        print("ATLAS_TIMEOUT_PROBE " + json.dumps({"stage": stage,
+            "error_type": type(exc).__name__, "errno": getattr(exc, "errno", None)}),
+            file=sys.stderr, flush=True)
+        raise SystemExit(1) from None
+
+
+def _timeout_probe_diagnostics(timed: dict, detached: Path) -> dict:
+    diagnostics = {"timed_out": bool(timed["timed_out"]), "returncode": timed["returncode"],
+        "probe_ready": bool(timed.get("probe_ready")), "detached_pid_file_exists": detached.is_file(),
+        "descendant_pid_valid": False, "descendant_alive": False,
+        "stderr_present": bool(timed["stderr"])}
+    if diagnostics["detached_pid_file_exists"]:
+        try:
+            pid = int(detached.read_text())
+            diagnostics["descendant_pid_valid"] = pid > 1
+            if pid > 1:
+                try:
+                    os.kill(pid, 0)
+                    diagnostics["descendant_alive"] = True
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    diagnostics["descendant_alive"] = True
+        except (OSError, ValueError):
+            pass
+    for line in timed["stderr"][-2048:].splitlines():
+        if line.startswith("ATLAS_TIMEOUT_PROBE "):
+            try:
+                record = json.loads(line.partition(" ")[2])
+                if (record.get("stage") in {"fork", "detach", "pid_file"}
+                    and isinstance(record.get("error_type"), str)
+                    and record["error_type"].isidentifier() and len(record["error_type"]) <= 64
+                    and (record.get("errno") is None or type(record["errno"]) is int)):
+                    diagnostics["child_error"] = {key: record.get(key) for key in ("stage", "error_type", "errno")}
+            except (ValueError, AttributeError):
+                pass
+    if timed["stderr"].strip():
+        error_type = timed["stderr"].strip().splitlines()[-1].partition(":")[0]
+        if error_type.isidentifier() and len(error_type) <= 64:
+            diagnostics["stderr_error_type"] = error_type
+    return diagnostics
+
+
 def run_native(run: Path, timeout: int, loader_env: dict[str, str], *, probe: bool = False,
                timeout_probe: bool = False, fixture_bridge: dict | None = None) -> dict:
     owner, sandbox = _accounts()
@@ -278,6 +349,7 @@ def run_native(run: Path, timeout: int, loader_env: dict[str, str], *, probe: bo
     approved_imports = _prepare_import_permissions()
     home = Path(tempfile.mkdtemp(prefix="atlas-vibe-job-"))
     timed_out = False
+    probe_ready = False
     try:
         _copy_loader_config(home)
         if fixture_bridge is not None:
@@ -302,6 +374,8 @@ def run_native(run: Path, timeout: int, loader_env: dict[str, str], *, probe: bo
                 user=sandbox.pw_uid, group=owner.pw_gid, extra_groups=[],
                 stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
             try:
+                if timeout_probe:
+                    probe_ready = _wait_timeout_probe_ready(process, run / "detached-probe.pid")
                 process.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
@@ -327,7 +401,8 @@ def run_native(run: Path, timeout: int, loader_env: dict[str, str], *, probe: bo
             stdout.seek(0)
             stderr.seek(0)
             return {"returncode": process.returncode, "stdout": stdout.read(MAX_OUTPUT).decode("utf-8", "replace"),
-                    "stderr": stderr.read(MAX_OUTPUT).decode("utf-8", "replace"), "timed_out": timed_out}
+                    "stderr": stderr.read(MAX_OUTPUT).decode("utf-8", "replace"), "timed_out": timed_out,
+                    "probe_ready": probe_ready}
     finally:
         shutil.rmtree(home)
 
@@ -414,13 +489,10 @@ def startup_probe() -> dict:
             raise RuntimeError("Isolated native backtest startup fixture failed: " + native["stderr"][-1800:])
         timed = run_native(run, 1, {}, timeout_probe=True)
         detached = run / "detached-probe.pid"
-        descendant_gone = False
-        if detached.is_file():
-            try:
-                os.kill(int(detached.read_text()), 0)
-            except ProcessLookupError:
-                descendant_gone = True
-        checks["timeout_cleanup"] = timed["timed_out"] and descendant_gone
+        diagnostics = _timeout_probe_diagnostics(timed, detached)
+        print("ATLAS_TIMEOUT_CLEANUP " + json.dumps(diagnostics, sort_keys=True), flush=True)
+        checks["timeout_cleanup"] = (diagnostics["timed_out"] and diagnostics["probe_ready"]
+            and diagnostics["descendant_pid_valid"] and not diagnostics["descendant_alive"])
         if not checks["timeout_cleanup"]:
             raise RuntimeError("Isolated timeout cleanup probe failed")
         return checks
@@ -535,11 +607,7 @@ if __name__ == "__main__":
             raise SystemExit("Invalid isolated input directories")
         abi = _apply_child_boundary(run, home, [Path(path) for path in raw_imports])
         if sys.argv[1] == "--timeout-child":
-            if os.fork() == 0:
-                os.setsid()
-                (run / "detached-probe.pid").write_text(str(os.getpid()))
-            while True:
-                time.sleep(1)
+            _timeout_probe_child(run)
         elif sys.argv[1] == "--probe-child":
             _probe_child(run, home, abi)
         else:
