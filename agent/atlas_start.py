@@ -13,6 +13,8 @@ def main():
     data = Path("/data")
     if os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") != str(data):
         raise SystemExit("Vibe requires a persistent Railway volume mounted at /data.")
+    from atlas_sandbox import configure_sandbox_identity
+    configure_sandbox_identity(data)
     account = pwd.getpwnam("vibe")
     uid, gid = account.pw_uid, account.pw_gid
     directories = {

@@ -114,6 +114,63 @@ class BrokerContractTests(unittest.TestCase):
                 sandbox.restrict_filesystem([], [])
 
 
+class SandboxIdentityTests(unittest.TestCase):
+    def test_identity_record_never_accepts_root_or_unbounded_ids(self):
+        self.assertEqual(sandbox._validate_sandbox_identity({"version": 1, "uid": 23456}), 23456)
+        for record in ({"version": 1, "uid": 0}, {"version": 1, "uid": 60000},
+                       {"version": 1, "uid": True}, {"version": True, "uid": 23456},
+                       {"version": 1, "uid": 23456, "command": "anything"}, [], None):
+            with self.subTest(record=record), self.assertRaises(RuntimeError):
+                sandbox._validate_sandbox_identity(record)
+
+    def test_persisted_identity_is_applied_only_to_the_fixed_sandbox_account(self):
+        accounts = types.ModuleType("pwd")
+        accounts.getpwnam = Mock(side_effect=[types.SimpleNamespace(pw_uid=10001),
+                                             types.SimpleNamespace(pw_uid=23456)])
+        accounts.getpwuid = Mock(side_effect=KeyError())
+        with patch.dict(sys.modules, {"pwd": accounts}), \
+             patch.object(sandbox.os, "getuid", create=True, return_value=0), \
+             patch.object(sandbox, "_load_sandbox_identity", return_value=23456) as load, \
+             patch.object(sandbox.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)) as run:
+            sandbox.configure_sandbox_identity(Path("/data"))
+        self.assertEqual(load.call_count, 2)  # Creation must survive a read-back.
+        self.assertEqual(run.call_args.args[0], ["/usr/sbin/usermod", "--uid", "23456", "vibe-sandbox"])
+        self.assertEqual(accounts.getpwnam.call_args_list[0].args, ("vibe-sandbox",))
+
+    def test_existing_identity_does_not_reallocate_or_modify_the_account(self):
+        accounts = types.ModuleType("pwd")
+        accounts.getpwnam = Mock(return_value=types.SimpleNamespace(pw_uid=23456))
+        with patch.dict(sys.modules, {"pwd": accounts}), \
+             patch.object(sandbox.os, "getuid", create=True, return_value=0), \
+             patch.object(sandbox, "_load_sandbox_identity", return_value=23456), \
+             patch.object(sandbox.subprocess, "run") as run:
+            sandbox.configure_sandbox_identity(Path("/data"))
+        run.assert_not_called()
+
+    def test_persisted_account_collision_fails_closed_without_modification(self):
+        accounts = types.ModuleType("pwd")
+        accounts.getpwnam = Mock(return_value=types.SimpleNamespace(pw_uid=10001))
+        accounts.getpwuid = Mock(return_value=types.SimpleNamespace(pw_name="another-account"))
+        with patch.dict(sys.modules, {"pwd": accounts}), \
+             patch.object(sandbox.os, "getuid", create=True, return_value=0), \
+             patch.object(sandbox, "_load_sandbox_identity", return_value=23456), \
+             patch.object(sandbox.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "conflicts"):
+                sandbox.configure_sandbox_identity(Path("/data"))
+        run.assert_not_called()
+
+    def test_unreadable_identity_never_triggers_reallocation(self):
+        accounts = types.ModuleType("pwd")
+        with patch.dict(sys.modules, {"pwd": accounts}), \
+             patch.object(sandbox.os, "getuid", create=True, return_value=0), \
+             patch.object(sandbox, "_load_sandbox_identity", side_effect=RuntimeError("invalid identity")) as load, \
+             patch.object(sandbox.subprocess, "run") as run:
+            with self.assertRaisesRegex(RuntimeError, "invalid identity"):
+                sandbox.configure_sandbox_identity(Path("/data"))
+        self.assertEqual(load.call_count, 1)
+        run.assert_not_called()
+
+
 class TimeoutProbeTests(unittest.TestCase):
     def test_ready_wait_tolerates_slow_start_and_partial_pid_write(self):
         process = Mock()

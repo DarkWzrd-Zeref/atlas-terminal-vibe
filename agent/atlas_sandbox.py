@@ -33,6 +33,8 @@ MAX_REQUEST = 65536
 MAX_OUTPUT = 2 * 1024 * 1024
 MAX_RESPONSE = 12 * MAX_OUTPUT + 65536  # JSON may escape each output byte.
 _JOB_LOCK = threading.Lock()
+_SANDBOX_UID_MIN = 20000
+_SANDBOX_UID_MAX = 60000  # Exclusive; remains within ordinary Linux UID maps.
 
 # Only loader credentials/configuration, never provider/API/broker credentials.
 # Interpreter, HOME, PYTHONPATH and dynamic-linker settings are broker-owned.
@@ -55,6 +57,76 @@ DATA_ENV = frozenset({
 def _accounts():
     import pwd
     return pwd.getpwnam("vibe"), pwd.getpwnam("vibe-sandbox")
+
+
+def _validate_sandbox_identity(record: object) -> int:
+    if (not isinstance(record, dict) or set(record) != {"version", "uid"}
+        or type(record.get("version")) is not int or record["version"] != 1 or type(record.get("uid")) is not int
+        or not _SANDBOX_UID_MIN <= record["uid"] < _SANDBOX_UID_MAX):
+        raise RuntimeError("Invalid persisted sandbox identity; startup refused")
+    return record["uid"]
+
+
+def _load_sandbox_identity(data: Path) -> int:
+    """Allocate once on the persistent volume; never retry a failing identity."""
+    import pwd
+    import secrets
+    parent = data.stat()
+    if data.resolve() != data or parent.st_uid != 0 or stat.S_IMODE(parent.st_mode) & 0o022:
+        raise RuntimeError("Sandbox identity requires a root-controlled persistent directory")
+    path = data / ".atlas-sandbox-identity.json"
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        # RLIMIT_NPROC is charged to real UID, which can be shared outside the
+        # container PID namespace. Avoid every installation using UID 10001.
+        # One candidate only: collision or later probe failure stays closed.
+        uid = _SANDBOX_UID_MIN + secrets.randbelow(_SANDBOX_UID_MAX - _SANDBOX_UID_MIN)
+        try:
+            pwd.getpwuid(uid)
+        except KeyError:
+            pass
+        else:
+            raise RuntimeError("Allocated sandbox identity is already in use; startup refused")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump({"version": 1, "uid": uid}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return uid
+    with os.fdopen(fd, "r") as handle:
+        info = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 128):
+            raise RuntimeError("Persisted sandbox identity permissions are invalid")
+        try:
+            return _validate_sandbox_identity(json.load(handle))
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeError("Persisted sandbox identity is unreadable; startup refused") from exc
+
+
+def configure_sandbox_identity(data: Path) -> None:
+    """Bind the image's dedicated account to its single persisted runtime UID."""
+    import pwd
+    if os.getuid() != 0:
+        raise RuntimeError("Only the startup supervisor may configure sandbox identity")
+    uid = _load_sandbox_identity(data)
+    if _load_sandbox_identity(data) != uid:
+        raise RuntimeError("Sandbox identity did not persist; startup refused")
+    account = pwd.getpwnam("vibe-sandbox")
+    if account.pw_uid != uid:
+        try:
+            pwd.getpwuid(uid)
+        except KeyError:
+            pass
+        else:
+            raise RuntimeError("Persisted sandbox identity conflicts with another account")
+        result = subprocess.run(["/usr/sbin/usermod", "--uid", str(uid), "vibe-sandbox"],
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10, check=False)
+        if result.returncode != 0 or pwd.getpwnam("vibe-sandbox").pw_uid != uid:
+            raise RuntimeError("Failed to configure persisted sandbox identity")
 
 
 def validate_run(raw: object, roots: tuple[Path, ...] = RUN_ROOTS) -> Path:
@@ -410,8 +482,11 @@ def run_native(run: Path, timeout: int, loader_env: dict[str, str], *, probe: bo
 def _probe_child(run: Path, home: Path, abi: int) -> None:
     owner, sandbox = _accounts()
     checks = {"uid": os.getuid() == sandbox.pw_uid, "groups": os.getgroups() == [], "landlock": abi >= 3}
+    import resource
+    checks["process_limit"] = resource.getrlimit(resource.RLIMIT_NPROC) == (64, 64)
     for label, path in (("secret_denied", DATA / (run.name + "-sentinel")),
                         ("settings_denied", DATA / "settings.env"),
+                        ("identity_denied", DATA / ".atlas-sandbox-identity.json"),
                         ("sibling_denied", DATA / (run.name + "-sibling")),
                         ("proc_denied", Path("/proc/1/environ"))):
         try:
