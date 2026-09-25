@@ -36,7 +36,8 @@ frontend/node_modules/
 frontend/tsconfig.tsbuildinfo
 
 # Tests & docs (not needed in production image)
-agent/tests/
+agent/tests/*
+!agent/tests/test_freqtrade_export.py
 docs/
 assets/
 build/
