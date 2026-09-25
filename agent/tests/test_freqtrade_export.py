@@ -3,9 +3,11 @@ import base64
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("freqtrade_export", Path(__file__).resolve().parents[1] / "src/api/freqtrade_export.py")
 exporter = importlib.util.module_from_spec(spec)
@@ -64,6 +66,30 @@ class ExportTests(unittest.TestCase):
             self.skipTest("This Windows account cannot create symlinks")
         with self.assertRaises(exporter.ExportError):
             exporter.export_freqtrade(self.runs, "run_123")
+
+    @unittest.skipUnless(os.open in os.supports_dir_fd and os.listdir in os.supports_fd, "Requires Linux directory handles")
+    def test_parent_replacement_cannot_redirect_an_open_export(self):
+        private = self.runs / "private"
+        private.mkdir()
+        (private / "ExampleStrategy.py").write_text("private-secret-sentinel")
+        original_listdir = os.listdir
+        target_inode = self.artifact.stat().st_ino
+        moved = self.artifact.with_name("old-export")
+        replaced = False
+        def racing_listdir(directory):
+            nonlocal replaced
+            if isinstance(directory, int) and os.fstat(directory).st_ino == target_inode and not replaced:
+                self.artifact.rename(moved)
+                self.artifact.symlink_to(private, target_is_directory=True)
+                replaced = True
+            return original_listdir(directory)
+        with patch.object(exporter.os, "listdir", racing_listdir):
+            # Keep feature detection true for the patched function.
+            with patch.object(exporter.os, "supports_fd", {*os.supports_fd, racing_listdir}):
+                result = exporter.export_freqtrade(self.runs, "run_123")
+        self.assertTrue(replaced)
+        file = next(f for f in result["files"] if f["path"] == "ExampleStrategy.py")
+        self.assertEqual(base64.b64decode(file["content_base64"]), self.source)
 
 
 if __name__ == "__main__":

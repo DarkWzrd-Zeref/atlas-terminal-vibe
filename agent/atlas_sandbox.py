@@ -100,7 +100,7 @@ def _prepare_permissions(run: Path, owner_uid: int, shared_gid: int) -> None:
     # denies every sibling and private file even when its Unix mode is broad.
     current = run.parent
     while current != DATA and current.is_relative_to(DATA):
-        os.chmod(current, stat.S_IMODE(current.stat().st_mode) | 0o011)
+        os.chmod(current, stat.S_IMODE(current.stat().st_mode) | 0o010)
         current = current.parent
     # fwalk descriptors and no-follow metadata operations prevent chown/chmod
     # from following model-created links outside the run tree.
@@ -119,12 +119,21 @@ def _prepare_permissions(run: Path, owner_uid: int, shared_gid: int) -> None:
                 os.close(filefd)
 
 
-def _prepare_import_permissions() -> None:
+def _prepare_import_permissions() -> list[Path]:
     # Imported datasets are explicit read-only inputs. Landlock denies writes
     # even if the application's group has write access through Unix modes.
+    available = []
     for root in IMPORT_ROOTS:
         if not root.is_dir() or root.resolve() != root:
             continue
+        # Determine existence while privileged, rather than asking the child
+        # to inspect missing paths beneath a private 0700 application home.
+        # Existing approved inputs need traversal only along their ancestors;
+        # do not grant directory listing or read access to the enclosing home.
+        current = root.parent
+        while current != DATA and current.is_relative_to(DATA):
+            os.chmod(current, stat.S_IMODE(current.stat().st_mode) | 0o010)
+            current = current.parent
         for directory, dirs, files, fd in os.fwalk(root, follow_symlinks=False):
             os.fchmod(fd, stat.S_IMODE(os.fstat(fd).st_mode) | 0o050)
             for name in files:
@@ -138,6 +147,8 @@ def _prepare_import_permissions() -> None:
                         os.fchmod(filefd, stat.S_IMODE(info.st_mode) | 0o040)
                 finally:
                     os.close(filefd)
+        available.append(root)
+    return available
 
 
 def _copy_loader_config(home: Path) -> None:
@@ -222,7 +233,7 @@ def restrict_filesystem(readonly: list[Path], writable: list[Path]) -> int:
     return abi
 
 
-def _apply_child_boundary(run: Path, home: Path) -> int:
+def _apply_child_boundary(run: Path, home: Path, approved_imports: list[Path]) -> int:
     import resource
     os.umask(0o007)
     for key, limit in ((resource.RLIMIT_AS, 4096 * 1024 * 1024), (resource.RLIMIT_NOFILE, 512),
@@ -231,7 +242,9 @@ def _apply_child_boundary(run: Path, home: Path) -> int:
         resource.setrlimit(key, (limit, limit))
     readonly = [Path(p) for p in ("/usr", "/opt/venv", "/lib", "/lib64", "/etc", "/app",
                                   "/dev/urandom", "/dev/random", "/sys/devices/system/cpu")]
-    readonly.extend(path for path in IMPORT_ROOTS if path.resolve() == path)
+    if len(approved_imports) > len(IMPORT_ROOTS) or any(path not in IMPORT_ROOTS for path in approved_imports):
+        raise RuntimeError("Unapproved isolated input directory")
+    readonly.extend(approved_imports)
     return restrict_filesystem(readonly, [run, home, Path("/dev/null")])
 
 
@@ -262,7 +275,7 @@ def run_native(run: Path, timeout: int, loader_env: dict[str, str], *, probe: bo
                timeout_probe: bool = False, fixture_bridge: dict | None = None) -> dict:
     owner, sandbox = _accounts()
     _prepare_permissions(run, owner.pw_uid, owner.pw_gid)
-    _prepare_import_permissions()
+    approved_imports = _prepare_import_permissions()
     home = Path(tempfile.mkdtemp(prefix="atlas-vibe-job-"))
     timed_out = False
     try:
@@ -282,7 +295,8 @@ def run_native(run: Path, timeout: int, loader_env: dict[str, str], *, probe: bo
                 os.chown(Path(root) / name, sandbox.pw_uid, owner.pw_gid)
                 os.chmod(Path(root) / name, 0o660)
         mode = "--timeout-child" if timeout_probe else "--probe-child" if probe else "--child"
-        cmd = [sys.executable, "-I", str(AGENT / "atlas_sandbox.py"), mode, str(run), str(home)]
+        cmd = [sys.executable, "-I", str(AGENT / "atlas_sandbox.py"), mode, str(run), str(home),
+               json.dumps([str(path) for path in approved_imports])]
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             process = subprocess.Popen(cmd, cwd=AGENT, env=_child_env(run, home, loader_env),
                 user=sandbox.pw_uid, group=owner.pw_gid, extra_groups=[],
@@ -488,9 +502,12 @@ def request_backtest(run: Path, timeout: int, env: dict[str, str]) -> subprocess
 if __name__ == "__main__":
     if sys.argv[1:] == ["--broker"]:
         serve()
-    elif len(sys.argv) == 4 and sys.argv[1] in {"--child", "--probe-child", "--timeout-child"}:
+    elif len(sys.argv) == 5 and sys.argv[1] in {"--child", "--probe-child", "--timeout-child"}:
         run, home = Path(sys.argv[2]), Path(sys.argv[3])
-        abi = _apply_child_boundary(run, home)
+        raw_imports = json.loads(sys.argv[4])
+        if not isinstance(raw_imports, list) or any(not isinstance(path, str) for path in raw_imports):
+            raise SystemExit("Invalid isolated input directories")
+        abi = _apply_child_boundary(run, home, [Path(path) for path in raw_imports])
         if sys.argv[1] == "--timeout-child":
             if os.fork() == 0:
                 os.setsid()

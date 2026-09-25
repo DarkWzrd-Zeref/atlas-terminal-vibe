@@ -106,6 +106,7 @@ RUN useradd --create-home --shell /usr/sbin/nologin vibe \
     && chown -R root:root /app /opt/venv \
     && chmod -R go-w /app /opt/venv \
     && chown vibe:vibe /home/vibe/.vibe-trading
+RUN python -m unittest discover -s agent/tests -p test_freqtrade_export.py -v
 USER vibe
 
 # Default port
