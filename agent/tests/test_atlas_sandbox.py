@@ -114,6 +114,61 @@ class BrokerContractTests(unittest.TestCase):
                 sandbox.restrict_filesystem([], [])
 
 
+class ChildSettingsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from pydantic_settings import BaseSettings, DotEnvSettingsSource, SettingsConfigDict
+        except ImportError:
+            raise unittest.SkipTest("Install the pinned pydantic-settings dependency for settings tests")
+        cls.source = DotEnvSettingsSource
+
+        class DependencySettings(BaseSettings):
+            model_config = SettingsConfigDict(env_file=".env", env_prefix="ATLAS_TEST_")
+            secret: str = "not-loaded"
+            data_key: str = "default-data"
+
+        cls.settings = DependencySettings
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.env_file = Path(self.temp.name) / ".env"
+        self.env_file.write_text("ATLAS_TEST_SECRET=synthetic-credential\n", encoding="utf-8")
+        self.source_patch = patch.object(self.source, "_read_env_files", self.source._read_env_files)
+        self.source_patch.start()
+
+    def tearDown(self):
+        self.source_patch.stop()
+        self.temp.cleanup()
+
+    def test_trusted_settings_keep_their_file_source(self):
+        with patch.dict(os.environ, {"ATLAS_SANDBOX_CHILD": "", "PYTHON_DOTENV_DISABLED": "1"}):
+            original = self.source._read_env_files
+            sandbox._disable_child_dotenv()
+            self.assertIs(self.source._read_env_files, original)
+            self.assertEqual(self.settings(_env_file=self.env_file).secret, "synthetic-credential")
+
+    def test_child_never_reads_dotenv_but_keeps_filtered_environment_and_init_values(self):
+        with patch.dict(os.environ, {"ATLAS_SANDBOX_CHILD": "1", "PYTHON_DOTENV_DISABLED": "1",
+                                    "ATLAS_TEST_DATA_KEY": "allowed-data"}), \
+             patch("pydantic_settings.sources.providers.dotenv.dotenv_values",
+                   side_effect=PermissionError("synthetic private settings")) as read:
+            # Demonstrate why PYTHON_DOTENV_DISABLED alone is insufficient.
+            with self.assertRaises(PermissionError):
+                self.settings(_env_file=self.env_file)
+            read.reset_mock()
+            sandbox._disable_child_dotenv()
+            for env_file in (None, self.env_file, [self.env_file, self.env_file]):
+                with self.subTest(env_file=env_file):
+                    value = self.settings(_env_file=env_file)
+                    self.assertEqual(value.secret, "not-loaded")
+                    self.assertEqual(value.data_key, "allowed-data")
+            self.assertEqual(self.settings().secret, "not-loaded")
+            self.assertEqual(self.settings(data_key="explicit").data_key, "explicit")
+            self.assertEqual(self.source(self.settings, env_file=self.env_file)(), {})
+            read.assert_not_called()
+
+
 class RunnerBrokerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

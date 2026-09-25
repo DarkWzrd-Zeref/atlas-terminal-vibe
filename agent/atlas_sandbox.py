@@ -475,6 +475,32 @@ def serve() -> None:
         server.serve_forever()
 
 
+def _disable_child_dotenv() -> None:
+    """Keep dependency settings on the broker-filtered environment only.
+
+    Pydantic settings calls dotenv_values directly, which ignores
+    PYTHON_DOTENV_DISABLED. Some native dependencies create settings during
+    import, so disable that file source before importing the native runner.
+    This is child-process compatibility policy, not the security boundary:
+    Landlock still denies private files even if generated code undoes it.
+    The privileged broker and trusted web server never install this policy.
+    """
+    if os.environ.get("ATLAS_SANDBOX_CHILD") != "1":
+        return
+    from pydantic_settings import DotEnvSettingsSource
+
+    if not callable(getattr(DotEnvSettingsSource, "_read_env_files", None)):
+        raise RuntimeError("Unsupported isolated settings file source")
+
+    def no_env_files(self):
+        return {}
+
+    # Covers model_config env_file, constructor _env_file overrides, and
+    # dependencies constructing the source directly, without touching the
+    # separate EnvSettingsSource or constructor/default settings sources.
+    DotEnvSettingsSource._read_env_files = no_env_files
+
+
 def request_backtest(run: Path, timeout: int, env: dict[str, str]) -> subprocess.CompletedProcess:
     payload = {"operation": "backtest", "run_dir": str(run), "timeout": timeout,
                "env": {k: v for k, v in env.items() if k in DATA_ENV}}
@@ -519,6 +545,7 @@ if __name__ == "__main__":
         else:
             # The only production entry point, identical to BacktestTool's
             # native invocation. Import resolution cannot use client paths.
+            _disable_child_dotenv()
             import runpy
             sys.path.insert(0, str(AGENT))
             sys.argv = [str(AGENT / "backtest" / "runner.py"), str(run)]
